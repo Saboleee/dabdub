@@ -39,7 +39,9 @@ soroban contract invoke \
 
 ## Incident: `ESCROW.emergency_drain` Event
 
-An `emergency_drain` event on `payment_escrow` is a critical security event and must page on-call immediately.
+### Symptoms
+- Grafana alert `payment_escrow: emergency_drain` fires (pages PagerDuty + Slack `#security`)
+- A Loki log line contains an `ESCROW.emergency_drain` event on `payment_escrow`
 
 ### Grafana Alert Rule
 
@@ -117,11 +119,23 @@ policies:
 
 ### Response Steps
 
-1. **Acknowledge the page** in PagerDuty and join the `#security` Slack channel.
+1. **Acknowledge the page** in PagerDuty and open the `#security` Slack thread.
+
 2. **Confirm the event** in Loki:
 ```logql
-{job="payment_escrow"} |= "ESCROW.emergency_drain"
+{contract="payment_escrow"} |= "ESCROW.emergency_drain"
 ```
-3. **Identify the drain** - inspect the emitting transaction and the escrow contract state.
-4. **Contain** - pause affected escrow operations and rotate any compromised keys.
-5. **Escalate** - notify the security lead and follow the scheduled-change cancellation steps above if an admin change is involved.
+
+3. **Identify the caller** - inspect the event payload for the invoking address and
+   correlate with the escrow contract's admin/operator keys.
+
+4. **Freeze further activity** - if the drain was not authorized, pause escrow
+   operations and rotate any exposed operator keys.
+
+5. **Escalate** - notify the security lead and, if funds moved, begin the
+   incident-response fund-tracing process.
+
+### Prevention
+- Keep escrow operator keys in secure hardware wallets / multisig
+- Alert on any `ESCROW.emergency_drain` event (see Grafana rule `payment_escrow_emergency_drain`)
+- Review drain authorization policy regularly

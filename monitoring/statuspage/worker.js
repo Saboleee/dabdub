@@ -11,6 +11,7 @@
  *
  * Environment variables (set in wrangler.toml or Cloudflare dashboard):
  *   API_ORIGIN  = https://api.cheesepay.xyz   (no trailing slash)
+ *   SOROBAN_RPC_URL = https://soroban-testnet.stellar.org (Soroban RPC endpoint)
  */
 
 // ─── HTML is inlined at build time via wrangler's text_blobs or fetched ───────
@@ -81,11 +82,113 @@ async function proxyHealthAdmin(env) {
     body = { status: 'down', timestamp: new Date().toISOString(), error: 'Invalid response' };
   }
 
-  return jsonResponse(body, upstreamRes.status, {
+  // ── Soroban-specific health checks ────────────────────────────────────────
+  // Run in parallel; each check is isolated so one failure never breaks the
+  // rest of the status payload.
+  const [sorobanRpc, escrowIndexer, feeCalculator] = await Promise.all([
+    checkSorobanRpc(env),
+    checkEscrowIndexer(apiOrigin),
+    checkFeeCalculator(apiOrigin),
+  ]);
+
+  const components = {
+    ...(body && typeof body === 'object' && body.components ? body.components : {}),
+    sorobanRpc,
+    escrowIndexer,
+    feeCalculator,
+  };
+
+  // Degrade overall status if any Soroban check is down.
+  const sorobanDown = [sorobanRpc, escrowIndexer, feeCalculator].some(
+    (c) => c.status === 'down',
+  );
+  const overallStatus = sorobanDown ? 'degraded' : (body?.status ?? 'up');
+
+  const merged = {
+    ...(body && typeof body === 'object' ? body : {}),
+    status: overallStatus,
+    timestamp: body?.timestamp ?? new Date().toISOString(),
+    components,
+  };
+
+  return jsonResponse(merged, upstreamRes.status, {
     // Cache for 30 seconds at the edge — status page polls every 60s so this
     // halves upstream load while keeping data fresh enough.
     'Cache-Control': 'public, max-age=30, s-maxage=30',
   });
+}
+
+// ─── Soroban RPC response time check ──────────────────────────────────────────
+async function checkSorobanRpc(env) {
+  const rpcUrl = env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org';
+  const start = Date.now();
+  try {
+    const res = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth', params: {} }),
+    });
+    const latency = Date.now() - start;
+    if (!res.ok) {
+      return { status: 'down', latency, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    const healthy = data?.result?.status === 'healthy';
+    return {
+      status: healthy ? 'up' : 'degraded',
+      latency,
+      ...(healthy ? {} : { error: data?.result?.status ?? 'unhealthy' }),
+    };
+  } catch (err) {
+    return { status: 'down', latency: Date.now() - start, error: 'RPC unreachable' };
+  }
+}
+
+// ─── Last payment_escrow event indexed within 30s ─────────────────────────────
+async function checkEscrowIndexer(apiOrigin) {
+  const MAX_AGE_MS = 30_000;
+  try {
+    const res = await fetch(`${apiOrigin}/health/indexer`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) {
+      return { status: 'down', lastEventAgeMs: null, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    const lastEventAt = data?.lastPaymentEscrowEventAt;
+    if (!lastEventAt) {
+      return { status: 'down', lastEventAgeMs: null, error: 'No payment_escrow event indexed' };
+    }
+    const ageMs = Date.now() - new Date(lastEventAt).getTime();
+    return {
+      status: ageMs <= MAX_AGE_MS ? 'up' : 'degraded',
+      lastEventAgeMs: ageMs,
+      ...(ageMs <= MAX_AGE_MS ? {} : { error: 'payment_escrow event stale (>30s)' }),
+    };
+  } catch (err) {
+    return { status: 'down', lastEventAgeMs: null, error: 'Indexer unreachable' };
+  }
+}
+
+// ─── fee_calculator returns valid fee for test merchant ───────────────────────
+async function checkFeeCalculator(apiOrigin) {
+  try {
+    const res = await fetch(`${apiOrigin}/health/fee-calculator`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) {
+      return { status: 'down', error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    const fee = data?.fee;
+    const valid = typeof fee === 'number' && Number.isFinite(fee) && fee >= 0;
+    return {
+      status: valid ? 'up' : 'down',
+      ...(valid ? { fee } : { error: 'Invalid fee for test merchant' }),
+    };
+  } catch (err) {
+    return { status: 'down', error: 'Fee calculator unreachable' };
+  }
 }
 
 // ─── Serve status page HTML ───────────────────────────────────────────────────

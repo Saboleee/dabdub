@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::{SlippageProtectionContract, SlippageProtectionContractClient};
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
 
 fn setup_env() -> (Env, SlippageProtectionContractClient<'static>, Address) {
     let env = Env::default();
@@ -127,4 +127,83 @@ fn test_non_admin_cannot_set_slippage() {
 fn test_set_max_slippage_rejects_out_of_range_bps() {
     let (_env, client, admin) = setup_env();
     client.set_max_slippage(&admin, &10_001);
+}
+
+// ── per-pair slippage: XLM/USDC ──────────────────────────────────────────────
+
+#[test]
+fn test_xlm_usdc_pair_falls_back_to_global_max() {
+    let (env, client, _admin) = setup_env();
+    let pair = Symbol::new(&env, "XLM_USDC");
+    // No per-pair override → falls back to global 100 bps.
+    assert_eq!(client.get_pair_max_slippage(&pair), 100);
+    // 1% deviation passes at the global default.
+    client.check_slippage_for_pair(&pair, &10_000, &9_900);
+}
+
+#[test]
+fn test_xlm_usdc_pair_uses_admin_override() {
+    let (env, client, admin) = setup_env();
+    let pair = Symbol::new(&env, "XLM_USDC");
+    client.set_pair_max_slippage(&admin, &pair, &30); // 0.3%
+    assert_eq!(client.get_pair_max_slippage(&pair), 30);
+    // 0.2% deviation passes under the tighter per-pair limit.
+    client.check_slippage_for_pair(&pair, &10_000, &9_980);
+}
+
+#[test]
+#[should_panic(expected = "SlippageExceeded")]
+fn test_xlm_usdc_pair_override_rejects_over_limit() {
+    let (env, client, admin) = setup_env();
+    let pair = Symbol::new(&env, "XLM_USDC");
+    client.set_pair_max_slippage(&admin, &pair, &30); // 0.3%
+    // 0.5% deviation exceeds the per-pair limit even though it is within global.
+    client.check_slippage_for_pair(&pair, &10_000, &9_950);
+}
+
+// ── per-pair slippage: USDC/NGN ──────────────────────────────────────────────
+
+#[test]
+fn test_usdc_ngn_pair_falls_back_to_global_max() {
+    let (env, client, _admin) = setup_env();
+    let pair = Symbol::new(&env, "USDC_NGN");
+    assert_eq!(client.get_pair_max_slippage(&pair), 100);
+    client.check_slippage_for_pair(&pair, &10_000, &9_900);
+}
+
+#[test]
+fn test_usdc_ngn_pair_uses_admin_override() {
+    let (env, client, admin) = setup_env();
+    let pair = Symbol::new(&env, "USDC_NGN");
+    client.set_pair_max_slippage(&admin, &pair, &250); // 2.5%
+    assert_eq!(client.get_pair_max_slippage(&pair), 250);
+    // 2% deviation passes under the relaxed per-pair limit.
+    client.check_slippage_for_pair(&pair, &10_000, &9_800);
+}
+
+#[test]
+#[should_panic(expected = "SlippageExceeded")]
+fn test_usdc_ngn_pair_override_rejects_over_limit() {
+    let (env, client, admin) = setup_env();
+    let pair = Symbol::new(&env, "USDC_NGN");
+    client.set_pair_max_slippage(&admin, &pair, &250); // 2.5%
+    // 3% deviation exceeds the per-pair limit.
+    client.check_slippage_for_pair(&pair, &10_000, &9_700);
+}
+
+#[test]
+#[should_panic(expected = "Not admin")]
+fn test_non_admin_cannot_set_pair_slippage() {
+    let (env, client, _admin) = setup_env();
+    let pair = Symbol::new(&env, "XLM_USDC");
+    let random = Address::generate(&env);
+    client.set_pair_max_slippage(&random, &pair, &50);
+}
+
+#[test]
+#[should_panic(expected = "bps must be <= 10000")]
+fn test_set_pair_max_slippage_rejects_out_of_range_bps() {
+    let (env, client, admin) = setup_env();
+    let pair = Symbol::new(&env, "XLM_USDC");
+    client.set_pair_max_slippage(&admin, &pair, &10_001);
 }
